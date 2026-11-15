@@ -55,14 +55,90 @@ nicks_db = load_json(NICKS_FILE, {})
 stats_db = load_json(STATS_FILE, [])
 pending_db = load_json(PENDING_FILE, {})
 
-# ====================== ТЕКСТ СООБЩЕНИЯ В ПРИХОЖЕЙ ======================
+# ====================== ТЕКСТ СООБЩЕНИЯ ======================
 LOBBY_TEXT = (
     "**📋 Заявка на вступление в семью «Атлантис»**\n\n"
     "Нажмите кнопку ниже, чтобы подать заявку.\n\n"
     f"**📖 Законодательство штата:** {LAW_LINK}"
 )
 
-# ====================== ФОРМА ЗАЯВКИ ======================
+# ====================== БОТ И КЛАССЫ ======================
+class MyBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.members = True
+        super().__init__(command_prefix="!", intents=intents)
+
+    async def setup_hook(self):
+        self.add_view(LobbyView())
+        self.add_view(ReviewView())
+        if GUILD_ID:
+            await self.tree.sync(guild=discord.Object(id=GUILD_ID))
+        else:
+            await self.tree.sync()
+        self.lobby_loop.start()
+        self.reminder_loop.start()
+
+    @tasks.loop(minutes=3)
+    async def lobby_loop(self):
+        await self.wait_until_ready()
+        await self.ensure_lobby_message()
+
+    async def ensure_lobby_message(self):
+        guild = self.get_guild(GUILD_ID)
+        if guild is None:
+            return
+        lobby = guild.get_channel(LOBBY_CHANNEL_ID)
+        if lobby is None:
+            return
+        async for msg in lobby.history(limit=50):
+            if msg.author.id != self.user.id:
+                continue
+            for row in msg.components:
+                for child in row.children:
+                    if getattr(child, "custom_id", None) == "lobby_apply":
+                        if msg.embeds and LOBBY_TEXT not in (msg.embeds[0].description or ""):
+                            embed = discord.Embed(title="📋 Заявка на вступление",
+                                                  description=LOBBY_TEXT, color=discord.Color.gold())
+                            await msg.edit(embed=embed, view=LobbyView())
+                        return
+        embed = discord.Embed(title="📋 Заявка на вступление",
+                              description=LOBBY_TEXT, color=discord.Color.gold())
+        await lobby.send(embed=embed, view=LobbyView())
+
+    @tasks.loop(hours=1)
+    async def reminder_loop(self):
+        await self.wait_until_ready()
+        guild = self.get_guild(GUILD_ID)
+        if guild is None:
+            return
+        review = guild.get_channel(REVIEW_CHANNEL_ID)
+        if review is None:
+            return
+        now = datetime.datetime.utcnow()
+        for tid, info in list(pending_db.items()):
+            if info.get("reminded"):
+                continue
+            created = datetime.datetime.fromisoformat(info["created"])
+            if (now - created).total_seconds() < 24 * 3600:
+                continue
+            thread = guild.get_thread(int(tid))
+            if thread is None:
+                continue
+            member = guild.get_member(info["user_id"])
+            if member:
+                hs = guild.get_role(HIGH_STAFF_ROLE_ID)
+                await review.send(
+                    f"⏰ {hs.mention if hs else '@High Staff'} заявка от {member.mention} висит более 24 часов!"
+                )
+                info["reminded"] = True
+                save_json(PENDING_FILE, pending_db)
+
+# Создаем объект бота ДО декораторов
+bot = MyBot()
+
+# ====================== КЛАССЫ UI ======================
 class ApplicationModal(discord.ui.Modal, title="Заявка на вступление"):
     static_id = discord.ui.TextInput(label="Static ID", placeholder="Например: 27304", max_length=30)
     nickname = discord.ui.TextInput(label="Никнейм (без фракции)", placeholder="Например: Ken Atlantis", max_length=50)
@@ -85,7 +161,6 @@ class ApplicationModal(discord.ui.Modal, title="Заявка на вступле
     async def on_submit(self, interaction: discord.Interaction):
         guild = interaction.guild
 
-        # Защита от дублей
         for tid, info in pending_db.items():
             if info.get("user_id") == interaction.user.id:
                 thread = guild.get_thread(int(tid))
@@ -95,7 +170,6 @@ class ApplicationModal(discord.ui.Modal, title="Заявка на вступле
                 )
                 return
 
-        # Проверка занятого ника
         nick_key = self.nickname.value.strip().lower()
         if nick_key in nicks_db and nicks_db[nick_key] != interaction.user.id:
             await interaction.response.send_message(
@@ -147,43 +221,6 @@ class ApplicationModal(discord.ui.Modal, title="Заявка на вступле
             f"После этого заявка автоматически уйдёт в High Staff."
         )
 
-# ====================== ПРОВЕРКА СКРИНШОТА ======================
-@bot.listen('on_message')
-async def on_message(message: discord.Message):
-    if message.author.bot or not message.guild:
-        return
-    info = pending_db.get(str(message.channel.id))
-    if not info:
-        return
-    if not message.attachments:
-        return
-
-    data = info["data"]
-    screenshot = message.attachments[0]
-    faction = data.get("faction") or "—"
-
-    embed = discord.Embed(title="📋 Новая заявка", color=discord.Color.blurple())
-    embed.add_field(name="Кандидат", value=f"<@{info['user_id']}>", inline=False)
-    embed.add_field(name="Static ID", value=data["static_id"], inline=True)
-    embed.add_field(name="Никнейм", value=data["nickname"], inline=True)
-    embed.add_field(name="Фракция", value=faction, inline=True)
-    embed.add_field(name="Знание законодательной базы", value=data["knowledge"][:1024], inline=False)
-    embed.set_image(url=screenshot.url)
-    embed.set_footer(
-        text=f"UserID:{info['user_id']}|Faction:{faction}|Static:{data['static_id']}|Nick:{data['nickname']}"
-    )
-
-    review = message.guild.get_channel(REVIEW_CHANNEL_ID)
-    if review:
-        await review.send(embed=embed, view=ReviewView())
-
-    del pending_db[str(message.channel.id)]
-    save_json(PENDING_FILE, pending_db)
-
-    await message.channel.send("✅ Заявка отправлена в High Staff. Тред закрывается.")
-    await message.channel.edit(archived=True, locked=True)
-
-# ====================== КНОПКИ РАССМОТРЕНИЯ ======================
 class ReviewView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -310,7 +347,6 @@ class ReviewView(discord.ui.View):
             discord.Color.gold(), f"🎖️ Выдал Гражданин {member.mention}",
         )
 
-# ====================== КНОПКА В ПРИХОЖЕЙ ======================
 class LobbyView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -320,82 +356,42 @@ class LobbyView(discord.ui.View):
     async def apply(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(ApplicationModal())
 
-# ====================== БОТ ======================
-class MyBot(commands.Bot):
-    def __init__(self):
-        intents = discord.Intents.default()
-        intents.message_content = True
-        intents.members = True
-        super().__init__(command_prefix="!", intents=intents)
+# ====================== СОБЫТИЯ И КОМАНДЫ ======================
+@bot.listen('on_message')
+async def on_message(message: discord.Message):
+    if message.author.bot or not message.guild:
+        return
+    info = pending_db.get(str(message.channel.id))
+    if not info:
+        return
+    if not message.attachments:
+        return
 
-    async def setup_hook(self):
-        self.add_view(LobbyView())
-        self.add_view(ReviewView())
-        if GUILD_ID:
-            await self.tree.sync(guild=discord.Object(id=GUILD_ID))
-        else:
-            await self.tree.sync()
-        self.lobby_loop.start()
-        self.reminder_loop.start()
+    data = info["data"]
+    screenshot = message.attachments[0]
+    faction = data.get("faction") or "—"
 
-    @tasks.loop(minutes=3)
-    async def lobby_loop(self):
-        await self.wait_until_ready()
-        await self.ensure_lobby_message()
+    embed = discord.Embed(title="📋 Новая заявка", color=discord.Color.blurple())
+    embed.add_field(name="Кандидат", value=f"<@{info['user_id']}>", inline=False)
+    embed.add_field(name="Static ID", value=data["static_id"], inline=True)
+    embed.add_field(name="Никнейм", value=data["nickname"], inline=True)
+    embed.add_field(name="Фракция", value=faction, inline=True)
+    embed.add_field(name="Знание законодательной базы", value=data["knowledge"][:1024], inline=False)
+    embed.set_image(url=screenshot.url)
+    embed.set_footer(
+        text=f"UserID:{info['user_id']}|Faction:{faction}|Static:{data['static_id']}|Nick:{data['nickname']}"
+    )
 
-    async def ensure_lobby_message(self):
-        guild = self.get_guild(GUILD_ID)
-        if guild is None:
-            return
-        lobby = guild.get_channel(LOBBY_CHANNEL_ID)
-        if lobby is None:
-            return
-        async for msg in lobby.history(limit=50):
-            if msg.author.id != self.user.id:
-                continue
-            for row in msg.components:
-                for child in row.children:
-                    if getattr(child, "custom_id", None) == "lobby_apply":
-                        if msg.embeds and LOBBY_TEXT not in (msg.embeds[0].description or ""):
-                            embed = discord.Embed(title="📋 Заявка на вступление",
-                                                  description=LOBBY_TEXT, color=discord.Color.gold())
-                            await msg.edit(embed=embed, view=LobbyView())
-                        return
-        embed = discord.Embed(title="📋 Заявка на вступление",
-                              description=LOBBY_TEXT, color=discord.Color.gold())
-        await lobby.send(embed=embed, view=LobbyView())
+    review = message.guild.get_channel(REVIEW_CHANNEL_ID)
+    if review:
+        await review.send(embed=embed, view=ReviewView())
 
-    @tasks.loop(hours=1)
-    async def reminder_loop(self):
-        await self.wait_until_ready()
-        guild = self.get_guild(GUILD_ID)
-        if guild is None:
-            return
-        review = guild.get_channel(REVIEW_CHANNEL_ID)
-        if review is None:
-            return
-        now = datetime.datetime.utcnow()
-        for tid, info in list(pending_db.items()):
-            if info.get("reminded"):
-                continue
-            created = datetime.datetime.fromisoformat(info["created"])
-            if (now - created).total_seconds() < 24 * 3600:
-                continue
-            thread = guild.get_thread(int(tid))
-            if thread is None:
-                continue
-            member = guild.get_member(info["user_id"])
-            if member:
-                hs = guild.get_role(HIGH_STAFF_ROLE_ID)
-                await review.send(
-                    f"⏰ {hs.mention if hs else '@High Staff'} заявка от {member.mention} висит более 24 часов!"
-                )
-                info["reminded"] = True
-                save_json(PENDING_FILE, pending_db)
+    del pending_db[str(message.channel.id)]
+    save_json(PENDING_FILE, pending_db)
 
-bot = MyBot()
+    await message.channel.send("✅ Заявка отправлена в High Staff. Тред закрывается.")
+    await message.channel.edit(archived=True, locked=True)
 
-# ====================== КОМАНДА СТАТИСТИКИ ======================
 @bot.tree.command(name="статистика", description="Статистика заявок за последние 7 дней")
 @app_commands.checks.has_permissions(administrator=True)
 async def stats_cmd(interaction: discord.Interaction):
@@ -412,4 +408,6 @@ async def stats_cmd(interaction: discord.Interaction):
     embed.add_field(name="⏳ В ожидании", value=str(pending_count))
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-bot.run(TOKEN)
+# ====================== ЗАПУСК ======================
+if __name__ == "__main__":
+    bot.run(TOKEN)
